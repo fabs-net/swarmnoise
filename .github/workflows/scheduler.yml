@@ -14,6 +14,7 @@ jobs:
 
     env:
       GREYNOISE_API_KEY: ${{ secrets.GREYNOISE_API_KEY }}
+      WORKSPACE_ID: ${{ secrets.WORKSPACE_ID }}
       SENSOR_ID: ${{ secrets.SENSOR_ID }}
       GH_TOKEN: ${{ secrets.GH_PAT }}
 

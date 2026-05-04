@@ -34,6 +34,8 @@ import requests
 # Configuration — confirmed via browser DevTools at viz.greynoise.io
 # ---------------------------------------------------------------------------
 SESSIONS_URL = "https://viz.greynoise.io/api/greynoise/workspace/sessions"
+# Workspace ID — from cookie activeWorkspace / stigg-entitlements in browser session
+# Passed as query param workspace_id to identify the active workspace without a session cookie
 PAGE_SIZE = 500          # UI uses 50; increase for efficiency (test if server caps it)
 FEED_RETENTION_DAYS = 30
 
@@ -48,6 +50,7 @@ def get_env(name: str) -> str:
 
 def fetch_sessions(
     api_key: str,
+    workspace_id: str,
     sensor_id: str,
     window_start: datetime,
     window_end: datetime,
@@ -81,6 +84,7 @@ def fetch_sessions(
             "page_size": PAGE_SIZE,
             "sort_by": "lastPacket",
             "sort_desc": "true",
+            "workspace_id": workspace_id,
         }
 
         try:
@@ -294,6 +298,7 @@ def is_first_run(repo_root: Path) -> bool:
 
 def main() -> None:
     api_key = get_env("GREYNOISE_API_KEY")
+    workspace_id = get_env("WORKSPACE_ID")
     sensor_id = get_env("SENSOR_ID")
 
     now = datetime.now(timezone.utc)
@@ -332,7 +337,7 @@ def main() -> None:
 
     try:
         print("[*] Fetching sessions...")
-        sessions = fetch_sessions(api_key, sensor_id, window_start, window_end)
+        sessions = fetch_sessions(api_key, workspace_id, sensor_id, window_start, window_end)
 
         print("[*] Updating threat feed...")
         feed_ip_count = update_threat_feed(sessions, repo_root, now)
