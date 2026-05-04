@@ -1,0 +1,188 @@
+name: Scheduler — Randomized Daily Fetch
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # Every hour on the hour
+  workflow_dispatch:       # Manual trigger for testing
+
+permissions:
+  contents: write
+
+jobs:
+  schedule-and-fetch:
+    runs-on: ubuntu-latest
+
+    env:
+      GREYNOISE_API_KEY: ${{ secrets.GREYNOISE_API_KEY }}
+      SENSOR_ID: ${{ secrets.SENSOR_ID }}
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Evaluate schedule and decide whether to fetch
+        id: schedule
+        shell: python
+        run: |
+          import json
+          import os
+          import random
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          now = datetime.now(timezone.utc)
+          today_str = now.strftime("%Y-%m-%d")
+          current_hour = now.hour
+          state_path = Path("state/today.json")
+
+          state = {}
+          if state_path.exists():
+              try:
+                  state = json.loads(state_path.read_text())
+              except Exception:
+                  state = {}
+
+          # New day — generate a fresh random schedule
+          if state.get("date") != today_str:
+              target_runs = random.randint(1, 10)
+
+              # Pick target_runs unique hours from the 24-hour day
+              # Spread them across the full day regardless of current hour
+              # so early-day runs don't cluster everything at the start
+              scheduled_hours = sorted(random.sample(range(0, 24), min(target_runs, 24)))
+
+              state = {
+                  "date": today_str,
+                  "target_runs": target_runs,
+                  "completed_runs": 0,
+                  "scheduled_hours": scheduled_hours,
+                  "completed_hours": [],
+                  "last_fetch_end": None,
+              }
+
+              state_path.parent.mkdir(exist_ok=True)
+              state_path.write_text(json.dumps(state, indent=2))
+
+              print(f"New day — scheduled {target_runs} runs at hours: {scheduled_hours}")
+
+          # Check if the current hour is a scheduled run that hasn't been done yet
+          should_fetch = (
+              current_hour in state.get("scheduled_hours", [])
+              and current_hour not in state.get("completed_hours", [])
+              and state.get("completed_runs", 0) < state.get("target_runs", 0)
+          )
+
+          # Determine time window for the fetch
+          # Use last_fetch_end as start if available, otherwise 6 hours ago
+          if should_fetch:
+              if state.get("last_fetch_end"):
+                  window_start = state["last_fetch_end"]
+              else:
+                  from datetime import timedelta
+                  window_start = (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+              window_end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+          else:
+              window_start = ""
+              window_end = ""
+
+          # Write outputs for subsequent steps
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"should_fetch={'true' if should_fetch else 'false'}\n")
+              f.write(f"window_start={window_start}\n")
+              f.write(f"window_end={window_end}\n")
+              f.write(f"current_hour={current_hour}\n")
+              f.write(f"target_runs={state.get('target_runs', 0)}\n")
+              f.write(f"completed_runs={state.get('completed_runs', 0)}\n")
+
+          if should_fetch:
+              print(f"Fetch scheduled for hour {current_hour} — window: {window_start} → {window_end}")
+          else:
+              scheduled = state.get("scheduled_hours", [])
+              completed = state.get("completed_runs", 0)
+              target = state.get("target_runs", 0)
+              print(f"No fetch this hour (hour={current_hour}, scheduled={scheduled}, "
+                    f"completed={completed}/{target})")
+
+      - name: Install dependencies
+        if: steps.schedule.outputs.should_fetch == 'true'
+        run: pip install -r requirements.txt --quiet
+
+      - name: Fetch GreyNoise Fortinet sessions
+        if: steps.schedule.outputs.should_fetch == 'true'
+        env:
+          TIME_WINDOW_START: ${{ steps.schedule.outputs.window_start }}
+          TIME_WINDOW_END: ${{ steps.schedule.outputs.window_end }}
+        run: python scripts/fetch_sessions.py
+
+      - name: Update state after successful fetch
+        if: steps.schedule.outputs.should_fetch == 'true'
+        shell: python
+        run: |
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          state_path = Path("state/today.json")
+          state = json.loads(state_path.read_text())
+
+          current_hour = int("${{ steps.schedule.outputs.current_hour }}")
+          now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          state["completed_runs"] += 1
+          if current_hour not in state["completed_hours"]:
+              state["completed_hours"].append(current_hour)
+          state["last_fetch_end"] = now_str
+
+          state_path.write_text(json.dumps(state, indent=2))
+          print(f"State updated — completed {state['completed_runs']}/{state['target_runs']} runs today")
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          git config user.name  "swarmnoise-bot"
+          git config user.email "swarmnoise-bot@users.noreply.github.com"
+
+          git add data/ runs/ state/
+
+          if git diff --staged --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          # Build commit message
+          SHOULD_FETCH="${{ steps.schedule.outputs.should_fetch }}"
+          COMPLETED="${{ steps.schedule.outputs.completed_runs }}"
+          TARGET="${{ steps.schedule.outputs.target_runs }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          if [ "$SHOULD_FETCH" = "true" ]; then
+            # Count sessions from the most recent run log
+            SESSION_COUNT=$(python3 -c "
+          import json, glob, os
+          logs = sorted(glob.glob('runs/*_run_log.json'))
+          if logs:
+              d = json.loads(open(logs[-1]).read())
+              print(d.get('sessions_found', 0))
+          else:
+              print(0)
+          ")
+            if [ "$SESSION_COUNT" -gt 0 ]; then
+              MSG="data: ${TIMESTAMP} — ${SESSION_COUNT} Fortinet sessions (run $((COMPLETED+1))/${TARGET})"
+            else:
+              MSG="run log: ${TIMESTAMP} — no sessions found (run $((COMPLETED+1))/${TARGET})"
+            fi
+          else
+            MSG="state: ${TIMESTAMP} — daily schedule initialized (${TARGET} runs planned)"
+          fi
+
+          git commit -m "$MSG"
+          git push
