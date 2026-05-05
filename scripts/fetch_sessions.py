@@ -361,7 +361,7 @@ def enrich_ips(
     ips_to_enrich: list,
     cache: dict,
     api_key: str,
-    max_per_min: int = 20,
+    max_per_min: int = 12,
 ) -> dict:
     """
     Look up each IP in the GreyNoise Community API and store the result in cache.
@@ -381,10 +381,11 @@ def enrich_ips(
     print(f"  [enrich] {len(ips_to_enrich)} IPs to enrich "
           f"(rate limit: {max_per_min}/min)")
 
-    req_headers   = {"key": api_key, "Accept": "application/json"}
-    interval      = 60.0 / max_per_min   # seconds between requests
-    done          = 0
-    errors        = 0
+    req_headers      = {"key": api_key, "Accept": "application/json"}
+    interval         = 60.0 / max_per_min
+    done             = 0
+    errors           = 0
+    consecutive_429s = 0
 
     for ip in ips_to_enrich:
         t_start = time.monotonic()
@@ -398,28 +399,21 @@ def enrich_ips(
             )
 
             if resp.status_code == 404:
-                # IP not in GreyNoise dataset — exclude from filtered feed
                 cache[ip] = {
                     "classification": "unknown",
                     "name":           None,
                     "checked_at":     now_str,
                 }
+                consecutive_429s = 0
             elif resp.status_code == 429:
-                print(f"  [enrich] Rate limited — sleeping 60s", file=sys.stderr)
-                time.sleep(60)
-                # Retry once
-                resp = requests.get(
-                    f"{COMMUNITY_API}/{ip}",
-                    headers=req_headers,
-                    timeout=15,
-                )
-                if resp.ok:
-                    data = resp.json()
-                    cache[ip] = {
-                        "classification": data.get("classification", "unknown"),
-                        "name":           data.get("name"),
-                        "checked_at":     now_str,
-                    }
+                consecutive_429s += 1
+                sleep_time = 120 if consecutive_429s >= 3 else 70
+                print(f"  [enrich] Rate limited (#{consecutive_429s}) — sleeping {sleep_time}s",
+                      file=sys.stderr)
+                time.sleep(sleep_time)
+                errors += 1
+                done += 1
+                continue
             elif resp.ok:
                 data = resp.json()
                 cache[ip] = {
@@ -427,8 +421,10 @@ def enrich_ips(
                     "name":           data.get("name"),
                     "checked_at":     now_str,
                 }
+                consecutive_429s = 0
             else:
                 errors += 1
+                consecutive_429s = 0
                 print(f"  [enrich] HTTP {resp.status_code} for {ip} — skipping",
                       file=sys.stderr)
 
