@@ -245,7 +245,7 @@ def _fetch_window_scrolled(
             except requests.HTTPError as exc:
                 status = exc.response.status_code if exc.response is not None else 0
                 if attempt < 3:
-                    wait = 5 * attempt
+                    wait = 30 * attempt
                     print(f"    [retry] HTTP {status} on attempt {attempt} — "
                           f"waiting {wait}s before retry")
                     time.sleep(wait)
@@ -363,6 +363,7 @@ def write_outputs(
     duration: float,
     error: str | None,
     feed_ip_count: int,
+    bootstrap: bool = False,
 ) -> None:
     """Write session data file (if sessions found) and run log (always)."""
     ts_str    = fetch_ts.strftime("%Y-%m-%d_%H%M")
@@ -389,8 +390,10 @@ def write_outputs(
     run_log_path.write_text(json.dumps(run_log, indent=2))
     print(f"[+] Run log written: {run_log_path.name}")
 
-    # Session data — only if we have sessions
-    if sessions:
+    # Session data — only if we have sessions AND it's not a bootstrap
+    # Bootstrap collects 1M+ sessions — writing them as JSON would exceed
+    # GitHub's 100MB file size limit. Run log is sufficient for auditing.
+    if sessions and not bootstrap:
         data_payload = {
             "fetch_timestamp":  fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sensor_id":        sensor_id,
@@ -403,6 +406,8 @@ def write_outputs(
         data_path = data_dir / f"{ts_str}.json"
         data_path.write_text(json.dumps(data_payload, indent=2))
         print(f"[+] Session data written: {data_path.name} ({len(sessions)} sessions)")
+    elif bootstrap:
+        print(f"[~] Bootstrap run — skipping session data file to avoid 100MB GitHub limit.")
     else:
         print("[~] No sessions found in this window — data file skipped.")
 
@@ -470,6 +475,7 @@ def main() -> None:
         sessions, sensor_id, workspace_id,
         window_start, window_end, now,
         duration, error, feed_ip_count,
+        bootstrap=bootstrap,
     )
 
     print(f"[*] Done in {duration:.1f}s — {len(sessions)} sessions, "
