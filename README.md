@@ -20,7 +20,7 @@ All source IPs observed attacking the sensor in the last 30 days. Best coverage,
 https://raw.githubusercontent.com/fabs-xyz/swarmnoise/main/feeds/fortinet_ips_filtered.txt
 ```
 
-Subset of the full feed where the IP is classified **malicious** or **suspicious** by the [GreyNoise Community API](https://www.greynoise.io/). IPs not present in the GreyNoise dataset (`unknown`) are excluded. Lower false-positive risk; smaller list.
+Subset of the full feed where the session is classified **malicious** by GreyNoise. Sourced from the [GreyNoise v3 Sessions API](https://docs.greynoise.io/reference/getsessions) with Lucene query filtering — no rate-limited enrichment APIs involved. Each IP includes enriched metadata (tags, CVEs, source geo, Suricata signatures) in `feeds/filtered_metadata.json`.
 
 Both feeds:
 - One IP per line, no comments, no headers
@@ -54,6 +54,18 @@ Each subsequent hourly check compares the current hour against the schedule and 
 
 The commit pattern is **organic and unpredictable** — anywhere from 1 to 10 commits per day at random times.
 
+### Two-API architecture
+
+The collector uses two separate GreyNoise API endpoints:
+
+| | Full feed | Filtered feed |
+|---|---|---|
+| **API** | v1 Swarm (`/v1/workspaces/{id}/sensors/activity`) | v3 Sessions (`/v3/sessions`) |
+| **Filter** | None — all sessions | `classification:malicious` (Lucene query) |
+| **Page size** | 1,000 | 100 |
+| **Pagination** | 30-min time chunks (scroll token unusable) | Standard page-based |
+| **Metadata** | Basic (IP, port, protocol) | Rich (tags, CVEs, geo, Suricata) |
+
 ### First run (bootstrap)
 
 On the first run `feeds/ip_metadata.json` does not exist, so the script automatically bootstraps the feed by fetching the last 30 days of data. This takes ~37 minutes (1,437 API calls at 0.5 s/call).
@@ -69,16 +81,14 @@ Instead, each fetch window is split into **30-minute chunks**. At the observed s
 ```
 swarmnoise/
 ├── .github/workflows/
-│   ├── scheduler.yml              # Hourly trigger, randomised schedule logic + fetch
-│   └── enrich.yml                 # Manual one-shot IP classification enrichment
+│   └── scheduler.yml              # Hourly trigger, randomised schedule logic + fetch
 ├── scripts/
-│   ├── fetch_sessions.py          # GreyNoise API fetch, feed update, enrichment, run log
-│   └── enrich_all.py              # Standalone full-cache enrichment script
+│   └── fetch_sessions.py          # v1 full feed + v3 filtered feed, run log
 ├── feeds/
 │   ├── fortinet_ips.txt           # Full IP blocklist (one IP per line)
-│   ├── fortinet_ips_filtered.txt  # Filtered feed (malicious/suspicious only)
-│   ├── ip_metadata.json           # Per-IP first_seen/last_seen metadata
-│   └── classification_cache.json  # GreyNoise Community API enrichment cache
+│   ├── fortinet_ips_filtered.txt  # Filtered feed (malicious IPs only)
+│   ├── ip_metadata.json           # Per-IP first_seen/last_seen (full feed)
+│   └── filtered_metadata.json    # Per-IP enriched metadata (filtered feed)
 ├── data/                          # Session JSON files (one per non-bootstrap run)
 ├── runs/                          # Run log JSON files (always written)
 ├── state/
@@ -145,8 +155,35 @@ Set these under **Settings → Secrets and variables → Actions**:
   "time_window_end": "2026-05-05T12:00:00Z",
   "sessions_found": 412,
   "feed_ip_count": 1349,
+  "filtered_ip_count": 87,
   "duration_seconds": 8.3,
   "error": null
+}
+```
+
+**`feeds/filtered_metadata.json`** — per-IP enriched metadata (filtered feed only)
+```json
+{
+  "192.0.2.1": {
+    "first_seen": "2026-04-05T09:00:00Z",
+    "last_seen": "2026-05-05T10:26:00Z",
+    "classification": "malicious",
+    "tags": ["Mirai TCP Scanner", "Mirai"],
+    "tag_categories": ["worm"],
+    "tag_intentions": ["malicious"],
+    "cves": [],
+    "country": "United States",
+    "country_code": "US",
+    "asn": "AS32181",
+    "org": "GigeNET",
+    "is_vpn": false,
+    "is_tor": false,
+    "is_bot": false,
+    "rdns": "host.example.com",
+    "destination_ports": [23, 80],
+    "protocols": ["tcp"],
+    "suricata_signatures": ["Mirai TCP Scanner"]
+  }
 }
 ```
 

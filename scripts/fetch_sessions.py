@@ -2,12 +2,24 @@
 """
 fetch_sessions.py
 
-Queries the GreyNoise Swarm sensor activity via the official API:
-  GET https://api.greynoise.io/v1/workspaces/{workspace_id}/sensors/activity
-  Auth: key: <GREYNOISE_API_KEY>
+Queries the GreyNoise Swarm sensor activity via two API endpoints:
 
-Writes session data to data/, a run log to runs/, and maintains a rolling
-30-day FortiGate-ready threat feed in feeds/fortinet_ips.txt.
+  1. Full feed (v1):
+     GET https://api.greynoise.io/v1/workspaces/{workspace_id}/sensors/activity
+     Returns all sessions — used for the full IP blocklist.
+
+  2. Filtered feed (v3):
+     GET https://api.greynoise.io/v3/sessions
+     Supports Lucene query filtering — used to extract only malicious sessions
+     and their enriched metadata (tags, CVEs, source geo, etc.).
+
+Auth: key: <GREYNOISE_API_KEY>
+
+Writes session data to data/, a run log to runs/, and maintains two rolling
+30-day FortiGate-ready threat feeds in feeds/:
+  - fortinet_ips.txt          — all attacker IPs
+  - fortinet_ips_filtered.txt — confirmed malicious IPs only
+  - filtered_metadata.json    — per-IP enriched metadata from v3 sessions
 
 Environment variables required:
   GREYNOISE_API_KEY  — GreyNoise API key (from viz.greynoise.io Settings → API)
@@ -353,133 +365,250 @@ def update_threat_feed(
     return len(sorted_ips), metadata
 
 
-COMMUNITY_API = "https://api.greynoise.io/v3/community"
-FILTERED_FEED_CLASSIFICATIONS = {"malicious", "suspicious"}
+V3_PAGE_SIZE          = 100
+FILTERED_QUERY        = "classification:malicious"
+FILTERED_CHUNK_HOURS  = 6
 
 
-def enrich_ips(
-    ips_to_enrich: list,
-    cache: dict,
+def _v3_fetch_page(
     api_key: str,
-    max_per_min: int = 12,
-) -> dict:
+    start_time: datetime,
+    end_time: datetime,
+    query: str,
+    page: int,
+    page_size: int = V3_PAGE_SIZE,
+    retries: int = 3,
+) -> tuple:
     """
-    Look up each IP in the GreyNoise Community API and store the result in cache.
-
-    Rate-limited to max_per_min requests per minute (hard limit is 25/min).
-    Returns the updated cache.
-
-    Cache entry format:
-      { "classification": "malicious"|"suspicious"|"benign"|"unknown",
-        "name": str|None, "checked_at": "2026-05-05T12:00:00Z" }
-
-    "unknown" means the IP is not in GreyNoise's dataset at all.
+    Fetch one page from the v3 sessions API.
+    Returns (sessions_list, total_count).
     """
-    if not ips_to_enrich:
-        return cache
+    params = {
+        "scope":      "workspace",
+        "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end_time":   end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "query":      query,
+        "page":       page,
+        "page_size":  page_size,
+    }
+    headers = {"key": api_key, "Accept": "application/json"}
 
-    print(f"  [enrich] {len(ips_to_enrich)} IPs to enrich "
-          f"(rate limit: {max_per_min}/min)")
-
-    req_headers      = {"key": api_key, "Accept": "application/json"}
-    interval         = 60.0 / max_per_min
-    done             = 0
-    errors           = 0
-    consecutive_429s = 0
-
-    for ip in ips_to_enrich:
-        t_start = time.monotonic()
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
+    for attempt in range(1, retries + 1):
         try:
             resp = requests.get(
-                f"{COMMUNITY_API}/{ip}",
-                headers=req_headers,
-                timeout=15,
+                f"{API_BASE}/v3/sessions",
+                headers=headers,
+                params=params,
+                timeout=60,
             )
 
-            if resp.status_code == 404:
-                cache[ip] = {
-                    "classification": "unknown",
-                    "name":           None,
-                    "checked_at":     now_str,
-                }
-                consecutive_429s = 0
-            elif resp.status_code == 429:
-                consecutive_429s += 1
-                sleep_time = 120 if consecutive_429s >= 3 else 70
-                print(f"  [enrich] Rate limited (#{consecutive_429s}) — sleeping {sleep_time}s",
-                      file=sys.stderr)
-                time.sleep(sleep_time)
-                errors += 1
-                done += 1
+            if resp.status_code in (429, 500, 502, 503, 504):
+                wait = 30 if resp.status_code == 429 else 15
+                print(f"  [v3 page {page}] HTTP {resp.status_code} — "
+                      f"retry {attempt}/{retries} in {wait}s", file=sys.stderr)
+                time.sleep(wait)
                 continue
-            elif resp.ok:
-                data = resp.json()
-                cache[ip] = {
-                    "classification": data.get("classification", "unknown"),
-                    "name":           data.get("name"),
-                    "checked_at":     now_str,
-                }
-                consecutive_429s = 0
-            else:
-                errors += 1
-                consecutive_429s = 0
-                print(f"  [enrich] HTTP {resp.status_code} for {ip} — skipping",
-                      file=sys.stderr)
+
+            if resp.status_code in (401, 403):
+                print(f"[error] v3 sessions HTTP {resp.status_code}: "
+                      f"{resp.text[:300]}", file=sys.stderr)
+                sys.exit(1)
+
+            if not resp.ok:
+                print(f"[error] v3 sessions HTTP {resp.status_code} on page {page}: "
+                      f"{resp.text[:300]}", file=sys.stderr)
+                return [], 0
+
+            data = resp.json()
+            return data.get("sessions", []), data.get("total", 0)
 
         except requests.RequestException as exc:
-            errors += 1
-            print(f"  [enrich] Request error for {ip}: {exc}", file=sys.stderr)
+            print(f"  [v3 page {page}] Request error (attempt {attempt}): {exc}",
+                  file=sys.stderr)
+            if attempt < retries:
+                time.sleep(15)
 
-        done += 1
-        if done % 50 == 0:
-            pct = done / len(ips_to_enrich) * 100
-            print(f"  [enrich] {done}/{len(ips_to_enrich)} ({pct:.0f}%)")
+    return [], 0
 
-        # Pace to stay under rate limit
-        elapsed = time.monotonic() - t_start
-        remaining = interval - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
 
-    classifications = {}
-    for entry in cache.values():
-        c = entry.get("classification", "unknown")
-        classifications[c] = classifications.get(c, 0) + 1
+def fetch_filtered_sessions(
+    api_key: str,
+    window_start: datetime,
+    window_end: datetime,
+) -> list:
+    """
+    Fetch malicious sessions via v3/sessions with classification:malicious.
+    Uses time-chunking (6-hour windows) and page-based pagination.
+    Returns all matching session objects with full metadata.
+    """
+    chunk_duration = timedelta(hours=FILTERED_CHUNK_HOURS)
+    all_sessions   = []
+    chunk_start    = window_start
+    chunk_num      = 0
 
-    print(f"  [enrich] Complete — {done} enriched, {errors} errors. "
-          f"Distribution: {classifications}")
+    while chunk_start < window_end:
+        chunk_end = min(chunk_start + chunk_duration, window_end)
+        chunk_num += 1
 
-    return cache
+        page      = 1
+        collected = 0
+        total     = None
+
+        while True:
+            sessions, total = _v3_fetch_page(
+                api_key, chunk_start, chunk_end,
+                FILTERED_QUERY, page,
+            )
+
+            if total is None:
+                total = 0
+
+            if not sessions:
+                break
+
+            all_sessions.extend(sessions)
+            collected += len(sessions)
+
+            if collected >= total or len(sessions) < V3_PAGE_SIZE:
+                break
+
+            page += 1
+            time.sleep(0.3)
+
+        if collected > 0:
+            print(f"  [v3 chunk {chunk_num}] "
+                  f"{chunk_start.strftime('%Y-%m-%dT%H:%MZ')} → "
+                  f"{chunk_end.strftime('%Y-%m-%dT%H:%MZ')}: "
+                  f"{collected} malicious sessions")
+
+        chunk_start = chunk_end
+        time.sleep(0.3)
+
+    print(f"  [v3] Total malicious sessions fetched: {len(all_sessions)}")
+    return all_sessions
 
 
 def update_filtered_feed(
-    cache: dict,
-    metadata: dict,
+    filtered_sessions: list,
     repo_root: Path,
+    fetch_ts: datetime,
 ) -> int:
     """
-    Write feeds/fortinet_ips_filtered.txt — only IPs in the 30-day rolling
-    metadata that are classified malicious or suspicious in the cache.
+    Update the filtered threat feed and per-IP metadata from v3 session data.
 
-    Returns count of IPs written.
+    Writes:
+      - feeds/fortinet_ips_filtered.txt  (one malicious IP per line)
+      - feeds/filtered_metadata.json     (enriched per-IP metadata)
+
+    Maintains a 30-day rolling window.
+
+    Returns the number of IPs in the filtered feed.
     """
     feeds_dir = repo_root / "feeds"
     feeds_dir.mkdir(exist_ok=True)
 
-    filtered_ips = sorted(
-        ip for ip in metadata
-        if cache.get(ip, {}).get("classification") in FILTERED_FEED_CLASSIFICATIONS
-    )
+    metadata_path = feeds_dir / "filtered_metadata.json"
+    feed_path     = feeds_dir / "fortinet_ips_filtered.txt"
 
-    feed_path = feeds_dir / "fortinet_ips_filtered.txt"
-    feed_path.write_text("\n".join(filtered_ips) + "\n" if filtered_ips else "")
+    metadata: dict = {}
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except Exception:
+            metadata = {}
 
-    print(f"  [filtered feed] {len(filtered_ips)} IPs "
-          f"(malicious/suspicious only) → {feed_path.name}")
+    now_str = fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    cutoff  = fetch_ts - timedelta(days=FEED_RETENTION_DAYS)
 
-    return len(filtered_ips)
+    for session in filtered_sessions:
+        if not isinstance(session, dict):
+            continue
+
+        ip = (session.get("source") or {}).get("ip")
+        if not ip or not isinstance(ip, str):
+            continue
+
+        src_meta = session.get("sourceMetadata") or {}
+        tags     = session.get("gnTagMetadata") or session.get("tag") or []
+
+        tag_names     = sorted(set(t.get("name") for t in tags if t.get("name")))
+        tag_categories = sorted(set(t.get("category") for t in tags if t.get("category")))
+        tag_cves_flat = []
+        for t in tags:
+            for cve in (t.get("cves") or []):
+                tag_cves_flat.append(cve)
+        tag_cves = sorted(set(tag_cves_flat))
+
+        intentions = sorted(set(
+            t.get("intention") for t in tags if t.get("intention")
+        ))
+
+        dest_port = (session.get("destination") or {}).get("port")
+        protocols = session.get("protocol") or []
+
+        suricata = session.get("suricata") or {}
+        suricata_signatures = suricata.get("signature") or []
+
+        if ip not in metadata:
+            metadata[ip] = {
+                "first_seen":         now_str,
+                "last_seen":          now_str,
+                "classification":     session.get("classification", "unknown"),
+                "tags":               tag_names,
+                "tag_categories":     tag_categories,
+                "tag_intentions":     intentions,
+                "cves":               tag_cves,
+                "country":            src_meta.get("country"),
+                "country_code":       src_meta.get("country_code"),
+                "asn":                src_meta.get("asn"),
+                "org":                src_meta.get("org"),
+                "is_vpn":             src_meta.get("is_vpn"),
+                "is_tor":             src_meta.get("is_tor"),
+                "is_bot":             src_meta.get("is_bot"),
+                "rdns":               src_meta.get("rdns"),
+                "destination_ports":  sorted(set(filter(None, [dest_port]))),
+                "protocols":          sorted(set(protocols)) if isinstance(protocols, list) else [],
+                "suricata_signatures": sorted(set(suricata_signatures)),
+            }
+        else:
+            entry = metadata[ip]
+            entry["last_seen"] = now_str
+            entry["tags"]          = sorted(set(entry.get("tags", []) + tag_names))
+            entry["tag_categories"] = sorted(set(entry.get("tag_categories", []) + tag_categories))
+            entry["tag_intentions"] = sorted(set(entry.get("tag_intentions", []) + intentions))
+            entry["cves"]          = sorted(set(entry.get("cves", []) + tag_cves))
+            if dest_port:
+                ports = entry.get("destination_ports", [])
+                if dest_port not in ports:
+                    ports.append(dest_port)
+                    entry["destination_ports"] = sorted(ports)
+            if isinstance(protocols, list):
+                entry["protocols"] = sorted(set(entry.get("protocols", []) + protocols))
+            if suricata_signatures:
+                entry["suricata_signatures"] = sorted(set(
+                    entry.get("suricata_signatures", []) + suricata_signatures
+                ))
+
+    pruned = [
+        ip for ip, meta in metadata.items()
+        if datetime.fromisoformat(meta["last_seen"].replace("Z", "+00:00")) < cutoff
+    ]
+    for ip in pruned:
+        del metadata[ip]
+
+    if pruned:
+        print(f"  [filtered feed] Pruned {len(pruned)} IPs older than "
+              f"{FEED_RETENTION_DAYS} days")
+
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+
+    sorted_ips = sorted(metadata.keys())
+    feed_path.write_text("\n".join(sorted_ips) + "\n" if sorted_ips else "")
+
+    print(f"  [filtered feed] {len(sorted_ips)} malicious IPs → {feed_path.name}")
+    print(f"  [filtered feed] Metadata → {metadata_path.name}")
+
+    return len(sorted_ips)
 
 
 def write_outputs(
@@ -492,6 +621,7 @@ def write_outputs(
     duration: float,
     error: str | None,
     feed_ip_count: int,
+    filtered_ip_count: int = 0,
     bootstrap: bool = False,
 ) -> None:
     """Write session data file (if sessions found) and run log (always)."""
@@ -512,6 +642,7 @@ def write_outputs(
         "time_window_end":  window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sessions_found":   len(sessions),
         "feed_ip_count":    feed_ip_count,
+        "filtered_ip_count": filtered_ip_count,
         "duration_seconds": round(duration, 2),
         "error":            error,
     }
@@ -563,8 +694,6 @@ def main() -> None:
     if bootstrap:
         print("[*] First run detected — bootstrapping feed with last 30 days of data")
         window_end   = now
-        # Start slightly inside the 30-day limit to avoid API boundary errors.
-        # The API rejects requests where start_time is exactly 30 days ago.
         window_start = now - timedelta(days=29, hours=23)
     elif window_start_str and window_end_str:
         window_start = datetime.fromisoformat(window_start_str.replace("Z", "+00:00"))
@@ -579,44 +708,31 @@ def main() -> None:
     print(f"    Window    : {window_start.strftime('%Y-%m-%dT%H:%M:%SZ')} → "
           f"{window_end.strftime('%Y-%m-%dT%H:%M:%SZ')}")
     print(f"    Bootstrap : {bootstrap}")
-    print(f"    Endpoint  : {API_BASE}/v1/workspaces/{{workspace_id}}/sensors/activity")
 
     t0    = time.monotonic()
     error = None
-    sessions      = []
-    feed_ip_count = 0
+    sessions       = []
+    feed_ip_count  = 0
     filtered_count = 0
 
-    # Load classification cache
-    cache_path = repo_root / "feeds" / "classification_cache.json"
-    cache: dict = {}
-    if cache_path.exists():
-        try:
-            cache = json.loads(cache_path.read_text())
-        except Exception:
-            cache = {}
-
     try:
-        print("[*] Fetching sessions...")
+        # --- Full feed (v1 API) ---
+        print(f"[*] Fetching all sessions (v1 API)...")
         sessions = fetch_sessions(api_key, workspace_id, window_start, window_end)
 
-        print("[*] Updating threat feed...")
-        feed_ip_count, metadata = update_threat_feed(sessions, repo_root, now)
+        print("[*] Updating full threat feed...")
+        feed_ip_count, _ = update_threat_feed(sessions, repo_root, now)
 
-        # Enrich any IPs not yet in the cache
-        new_ips = [ip for ip in metadata if ip not in cache]
-        if new_ips:
-            print(f"[*] Enriching {len(new_ips)} new IPs via GreyNoise Community API...")
-            cache = enrich_ips(new_ips, cache, api_key)
-            cache_path.parent.mkdir(exist_ok=True)
-            cache_path.write_text(json.dumps(cache, indent=2, sort_keys=True))
-            print(f"  [enrich] Cache saved ({len(cache)} total entries)")
-        else:
-            print("[*] No new IPs to enrich.")
+        # --- Filtered feed (v3 API) ---
+        print("[*] Fetching malicious sessions (v3 API)...")
+        filtered_sessions = fetch_filtered_sessions(
+            api_key, window_start, window_end,
+        )
 
-        # Write filtered feed
-        print("[*] Updating filtered feed...")
-        filtered_count = update_filtered_feed(cache, metadata, repo_root)
+        print("[*] Updating filtered feed + metadata...")
+        filtered_count = update_filtered_feed(
+            filtered_sessions, repo_root, now,
+        )
 
     except SystemExit:
         raise
@@ -631,11 +747,12 @@ def main() -> None:
         sessions, sensor_id, workspace_id,
         window_start, window_end, now,
         duration, error, feed_ip_count,
+        filtered_ip_count=filtered_count,
         bootstrap=bootstrap,
     )
 
     print(f"[*] Done in {duration:.1f}s — {len(sessions)} sessions, "
-          f"{feed_ip_count} IPs in feed, {filtered_count} in filtered feed.")
+          f"{feed_ip_count} IPs in full feed, {filtered_count} in filtered feed.")
 
 
 if __name__ == "__main__":
