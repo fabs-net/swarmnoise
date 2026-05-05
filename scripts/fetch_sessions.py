@@ -91,16 +91,7 @@ def _fetch_page(
         print(f"[error] Request failed on page {page_num}: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Debug: print response structure + ALL headers on first page
-    if page_num == 1:
-        if isinstance(data, dict):
-            print(f"  [debug] Response keys: {list(data.keys())}")
-        elif isinstance(data, list):
-            print(f"  [debug] Response: list of {len(data)} items")
-            if data:
-                print(f"  [debug] First item keys: {list(data[0].keys()) if isinstance(data[0], dict) else type(data[0])}")
-        # Print all response headers so we can identify the scroll token header name
-        print(f"  [debug] Response headers: {dict(resp.headers)}")
+
 
     # Extract sessions
     if isinstance(data, list):
@@ -168,29 +159,24 @@ def fetch_sessions(
     }
 
     total_duration = (window_end - window_start).total_seconds()
-    # X-Scroll-Id tokens from this API are ~8KB of base64 — too large to pass
-    # as a query parameter (causes HTTP 414 URI Too Long). We attempt to pass
-    # the token back as the X-Scroll-Id request header instead. For the
-    # bootstrap 30-day window we use 6-hour chunks as a fallback safety net.
-    CHUNK_HOURS      = 6
-    MAX_SCROLL_PAGES = 20
+    # The X-Scroll-Id token (~8KB base64) cannot be passed back either as a
+    # query param (HTTP 414) or as a request header (HTTP 400 header too large).
+    # Strategy: use 30-minute time chunks. At ~167 sessions/hour observed rate,
+    # 30-min chunks yield ~83 sessions — well under the 1000-session cap.
+    # If a chunk still hits 1000 we log a warning but continue (some sessions
+    # in high-traffic hours may be missed — acceptable for a threat feed).
+    # 30-day bootstrap = 1440 chunks (~24 min at 1 req/s).
+    CHUNK_SECONDS    = 30 * 60   # 30 minutes
+    MAX_SCROLL_PAGES = 1         # never attempt scroll (token unusable)
 
-    # For short windows (≤ CHUNK_HOURS), use a single scroll-paginated call
-    if total_duration <= CHUNK_HOURS * 3600:
-        return _fetch_window_scrolled(
-            url, req_headers, workspace_id,
-            window_start, window_end,
-            MAX_SCROLL_PAGES,
-        )
-
-    # For long windows, chunk by time
-    print(f"  [fetch] Window > {CHUNK_HOURS}h — using time-chunked fetching")
+    # Always chunk — even short windows use the same path for simplicity
+    print(f"  [fetch] Chunking into {CHUNK_SECONDS // 60}-min windows (scroll disabled)")
     all_sessions = []
-    chunk_start = window_start
-    chunk_num   = 0
+    chunk_start  = window_start
+    chunk_num    = 0
 
     while chunk_start < window_end:
-        chunk_end = min(chunk_start + timedelta(hours=CHUNK_HOURS), window_end)
+        chunk_end  = min(chunk_start + timedelta(seconds=CHUNK_SECONDS), window_end)
         chunk_num += 1
         print(f"  [chunk {chunk_num}] {chunk_start.strftime('%Y-%m-%dT%H:%MZ')} → "
               f"{chunk_end.strftime('%Y-%m-%dT%H:%MZ')}")
@@ -200,6 +186,9 @@ def fetch_sessions(
             MAX_SCROLL_PAGES,
         )
         all_sessions.extend(chunk_sessions)
+        if len(chunk_sessions) >= PAGE_SIZE:
+            print(f"  [warning] chunk {chunk_num} hit the {PAGE_SIZE}-session cap — "
+                  f"some sessions in this window may be missed")
         print(f"  [chunk {chunk_num}] {len(chunk_sessions)} sessions "
               f"(running total: {len(all_sessions)})")
         chunk_start = chunk_end
