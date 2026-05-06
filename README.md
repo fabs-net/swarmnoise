@@ -9,7 +9,7 @@ Produces a plain-text IP feed compatible with **FortiGate External Threat Feed**
 ### Full feed
 
 ```
-https://raw.githubusercontent.com/fabs-xyz/swarmnoise/main/feeds/fortinet_ips.txt
+https://raw.githubusercontent.com/fabs-net/swarmnoise/main/feeds/fortinet_ips.txt
 ```
 
 All source IPs observed attacking the sensor in the last 30 days. Best coverage, slightly higher false-positive risk.
@@ -17,7 +17,7 @@ All source IPs observed attacking the sensor in the last 30 days. Best coverage,
 ### Filtered feed
 
 ```
-https://raw.githubusercontent.com/fabs-xyz/swarmnoise/main/feeds/fortinet_ips_filtered.txt
+https://raw.githubusercontent.com/fabs-net/swarmnoise/main/feeds/fortinet_ips_filtered.txt
 ```
 
 Subset of the full feed where the session is classified **malicious** by GreyNoise. Sourced from the [GreyNoise v3 Sessions API](https://docs.greynoise.io/reference/getsessions) with Lucene query filtering — no rate-limited enrichment APIs involved. Each IP includes enriched metadata (tags, CVEs, source geo, Suricata signatures) in `feeds/filtered_metadata.json`.
@@ -34,7 +34,7 @@ Both feeds:
 | Field | Value |
 |---|---|
 | Name | `swarmnoise-fortinet` |
-| URI | `https://raw.githubusercontent.com/fabs-xyz/swarmnoise/main/feeds/fortinet_ips.txt` |
+| URI | `https://raw.githubusercontent.com/fabs-net/swarmnoise/main/feeds/fortinet_ips.txt` |
 | HTTP basic auth | off |
 | Refresh rate | 60 min |
 

@@ -199,5 +199,5 @@ jobs:
             MSG="state: ${TIMESTAMP} — daily schedule initialized (${TARGET} runs planned)"
           fi
 
-          git commit -m "$MSG" -m "Co-authored-by: fabs-xyz <93473332+fabs-xyz@users.noreply.github.com>"
+          git commit -m "$MSG" -m "Co-authored-by: fabs-net <93473332+fabs-net@users.noreply.github.com>"
           git push
