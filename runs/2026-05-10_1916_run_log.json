@@ -1,0 +1,10 @@
+{
+  "timestamp": "2026-05-10T19:16:46Z",
+  "time_window_start": "2026-05-10T13:16:44Z",
+  "time_window_end": "2026-05-10T19:16:44Z",
+  "sessions_found": 10993,
+  "feed_ip_count": 983,
+  "filtered_ip_count": 113,
+  "duration_seconds": 12.67,
+  "error": null
+}
