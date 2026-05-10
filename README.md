@@ -1,4 +1,4 @@
-# swarmnoise
+# SwarmNoise
 
 <p align="center">
   <img src="state/swarmnoise-banner_3.png" alt="Swarmnoise banner" />
@@ -9,7 +9,7 @@
 [![Threat Feed](https://img.shields.io/badge/Threat%20Feed-Firewall%20Ready-B22222)](#)
 [![GreyNoise](https://img.shields.io/badge/Source-GreyNoise%20Swarm-1F2937)](#)
 
-Automated collector for GreyNoise Project Swarm sensor activity. Deploys one or more Swarm sensors and produces newline-separated IP threat feeds compatible with any firewall or security platform that supports external IP block lists — including FortiGate, pfSense/OPNsense, Palo Alto Networks (EDL), and others. Monthly snapshots are archived for long-term evidence retention.
+Automated collector for [GreyNoise Project Swarm](https://www.greynoise.io/project-swarm) sensor activity. Deploys one or more Swarm sensors and produces newline-separated IP threat feeds compatible with any firewall or security platform that supports external IP block lists — including FortiGate, pfSense/OPNsense, Palo Alto Networks (EDL), and others. Monthly snapshots are archived for long-term evidence retention.
 
 ---
 
