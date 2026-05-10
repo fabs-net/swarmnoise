@@ -5,6 +5,8 @@
   "sessions_found": 0,
   "feed_ip_count": 0,
   "filtered_ip_count": 0,
+  "high_confidence_ip_count": 0,
+  "sensor_count": 1,
   "duration_seconds": 0.0,
   "error": null
 }

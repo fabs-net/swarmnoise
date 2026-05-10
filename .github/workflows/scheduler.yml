@@ -15,6 +15,7 @@ jobs:
     env:
       GREYNOISE_API_KEY: ${{ secrets.GREYNOISE_API_KEY }}
       WORKSPACE_ID: ${{ secrets.WORKSPACE_ID }}
+      SENSOR_IDS: ${{ secrets.SENSOR_IDS }}
       SENSOR_ID: ${{ secrets.SENSOR_ID }}
       GH_TOKEN: ${{ secrets.GH_PAT }}
 
@@ -248,8 +249,17 @@ jobs:
           else:
               print(0)
           ")
+            HC_COUNT=$(python3 -c "
+          import json, glob
+          logs = sorted(glob.glob('runs/*_run_log.json'))
+          if logs:
+              d = json.loads(open(logs[-1]).read())
+              print(d.get('high_confidence_ip_count', 0))
+          else:
+              print(0)
+          ")
             if [ "$SESSION_COUNT" -gt 0 ]; then
-              MSG="data: ${TIMESTAMP} — ${SESSION_COUNT} sessions, ${FEED_IP_COUNT} IPs in feed (run $((COMPLETED+1))/${TARGET})"
+              MSG="data: ${TIMESTAMP} — ${SESSION_COUNT} sessions, ${FEED_IP_COUNT} IPs in feed, ${HC_COUNT} high-confidence (run $((COMPLETED+1))/${TARGET})"
             else
               MSG="run log: ${TIMESTAMP} — no sessions found, ${FEED_IP_COUNT} IPs in feed (run $((COMPLETED+1))/${TARGET})"
             fi

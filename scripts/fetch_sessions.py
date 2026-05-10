@@ -15,16 +15,18 @@ Queries the GreyNoise Swarm sensor activity via two API endpoints:
 
 Auth: key: <GREYNOISE_API_KEY>
 
-Writes session data to data/, a run log to runs/, and maintains two rolling
+Writes session data to data/, a run log to runs/, and maintains three rolling
 30-day firewall-compatible threat feeds in feeds/:
-  - threat_feed.txt          — all attacker IPs
-  - threat_feed_filtered.txt — confirmed malicious and suspicious IPs
-  - filtered_metadata.json    — per-IP enriched metadata from v3 sessions
+  - threat_feed.txt                   — all attacker IPs
+  - threat_feed_filtered.txt          — confirmed malicious and suspicious IPs
+  - threat_feed_high_confidence.txt   — multi-sensor OR malicious-only IPs
+  - filtered_metadata.json            — per-IP enriched metadata from v3 sessions
 
 Environment variables required:
   GREYNOISE_API_KEY  — GreyNoise API key (from viz.greynoise.io Settings → API)
   WORKSPACE_ID       — GreyNoise workspace UUID
-  SENSOR_ID          — Swarm sensor UUID (used for logging/filtering only)
+  SENSOR_IDS         — Comma-separated uuid:label pairs (e.g. "uuid1:berlin,uuid2:tokyo")
+                       Falls back to SENSOR_ID (single sensor, label "default").
 """
 
 import json
@@ -50,6 +52,47 @@ def get_env(name: str) -> str:
         print(f"[error] Missing required environment variable: {name}", file=sys.stderr)
         sys.exit(1)
     return value
+
+
+def parse_sensor_ids() -> dict[str, str]:
+    """
+    Parse SENSOR_IDS env var into a {uuid: label} mapping.
+
+    Format: "uuid1:berlin,uuid2:tokyo,uuid3:amsterdam"
+    Falls back to SENSOR_ID with label "default" if SENSOR_IDS is not set.
+    """
+    raw = os.environ.get("SENSOR_IDS", "").strip()
+    if raw:
+        sensor_map: dict[str, str] = {}
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if ":" in entry:
+                uuid, label = entry.split(":", 1)
+                sensor_map[uuid.strip()] = label.strip()
+            else:
+                sensor_map[entry] = "default"
+        return sensor_map
+
+    fallback = os.environ.get("SENSOR_ID", "").strip()
+    if fallback:
+        return {fallback: "default"}
+
+    print("[error] Neither SENSOR_IDS nor SENSOR_ID is set.", file=sys.stderr)
+    sys.exit(1)
+
+
+def _extract_sensor_id(session: dict) -> str | None:
+    """Extract the sensor identifier from a session object (v1 or v3)."""
+    return (
+        session.get("sensor_id")
+        or session.get("sensorId")
+        or (session.get("sensor") or {}).get("id")
+        or (session.get("sensor") or {}).get("_id")
+        or session.get("sensorIdStr")
+        or session.get("sensor_id_str")
+    )
 
 
 def _fetch_page(
@@ -213,6 +256,13 @@ def fetch_sessions(
         chunk_start = chunk_end
         time.sleep(0.5)  # avoid rate-limit 500s
 
+    if all_sessions and os.environ.get("DEBUG_SESSION_KEYS", "").strip().lower() in ("1", "true", "yes"):
+        sample = all_sessions[0]
+        if isinstance(sample, dict):
+            print(f"  [debug] v1 session keys: {sorted(sample.keys())}")
+            sensor_val = _extract_sensor_id(sample)
+            print(f"  [debug] v1 sensor field value: {sensor_val}")
+
     return all_sessions
 
 
@@ -287,6 +337,7 @@ def update_threat_feed(
     sessions: list,
     repo_root: Path,
     fetch_ts: datetime,
+    sensor_map: dict[str, str] | None = None,
 ) -> int:
     """
     Update the firewall-compatible threat feed with IPs from the fetched sessions.
@@ -302,7 +353,6 @@ def update_threat_feed(
     metadata_path = feeds_dir / "ip_metadata.json"
     feed_path     = feeds_dir / "threat_feed.txt"
 
-    # Load existing metadata
     metadata: dict = {}
     if metadata_path.exists():
         try:
@@ -313,8 +363,7 @@ def update_threat_feed(
     now_str = fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
     cutoff  = fetch_ts - timedelta(days=FEED_RETENTION_DAYS)
 
-    # Extract source IPs — SDK confirms field is "source_ip"
-    new_ips: set = set()
+    ip_sensors: dict[str, set[str]] = {}
     for session in sessions:
         if not isinstance(session, dict):
             continue
@@ -326,21 +375,38 @@ def update_threat_feed(
             or session.get("src_ip")
             or session.get("sourceIp")
         )
-        if ip and isinstance(ip, str) and ip.strip():
-            new_ips.add(ip.strip())
+        if not ip or not isinstance(ip, str) or not ip.strip():
+            continue
+        ip = ip.strip()
 
+        sensor_uuid = _extract_sensor_id(session) if sensor_map else None
+        label = sensor_map.get(sensor_uuid, "unknown") if sensor_uuid and sensor_map else None
+
+        if ip not in ip_sensors:
+            ip_sensors[ip] = set()
+        if label:
+            ip_sensors[ip].add(label)
+
+    new_ips = set(ip_sensors.keys())
     print(f"  [feed] {len(new_ips)} unique source IPs extracted from {len(sessions)} sessions")
 
-    # Update metadata
     new_count = 0
     for ip in new_ips:
+        sensors = ip_sensors.get(ip, set())
         if ip not in metadata:
-            metadata[ip] = {"first_seen": now_str, "last_seen": now_str}
+            metadata[ip] = {
+                "first_seen": now_str,
+                "last_seen": now_str,
+                "seen_by": sorted(sensors) if sensors else [],
+            }
             new_count += 1
         else:
-            metadata[ip]["last_seen"] = now_str
+            entry = metadata[ip]
+            entry["last_seen"] = now_str
+            existing = set(entry.get("seen_by", []))
+            merged = sorted(existing | sensors) if sensors else sorted(existing)
+            entry["seen_by"] = merged
 
-    # Prune IPs outside the retention window
     pruned = [
         ip for ip, meta in metadata.items()
         if datetime.fromisoformat(meta["last_seen"].replace("Z", "+00:00")) < cutoff
@@ -353,10 +419,8 @@ def update_threat_feed(
 
     print(f"  [feed] {new_count} new IPs added, {len(metadata)} total IPs in feed")
 
-    # Write ip_metadata.json
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
 
-    # Write threat_feed.txt — sorted, one IP per line, no comments
     sorted_ips = sorted(metadata.keys())
     feed_path.write_text("\n".join(sorted_ips) + "\n" if sorted_ips else "")
 
@@ -485,6 +549,14 @@ def fetch_filtered_sessions(
         time.sleep(0.3)
 
     print(f"  [v3] Total filtered sessions fetched: {len(all_sessions)}")
+
+    if all_sessions and os.environ.get("DEBUG_SESSION_KEYS", "").strip().lower() in ("1", "true", "yes"):
+        sample = all_sessions[0]
+        if isinstance(sample, dict):
+            print(f"  [debug] v3 session keys: {sorted(sample.keys())}")
+            sensor_val = _extract_sensor_id(sample)
+            print(f"  [debug] v3 sensor field value: {sensor_val}")
+
     return all_sessions
 
 
@@ -492,6 +564,8 @@ def update_filtered_feed(
     filtered_sessions: list,
     repo_root: Path,
     fetch_ts: datetime,
+    sensor_map: dict[str, str] | None = None,
+    ip_metadata: dict | None = None,
 ) -> int:
     """
     Update the filtered threat feed and per-IP metadata from v3 session data.
@@ -549,6 +623,9 @@ def update_filtered_feed(
         suricata = session.get("suricata") or {}
         suricata_signatures = suricata.get("signature") or []
 
+        sensor_uuid = _extract_sensor_id(session) if sensor_map else None
+        sensor_label = sensor_map.get(sensor_uuid, "unknown") if sensor_uuid and sensor_map else None
+
         if ip not in metadata:
             metadata[ip] = {
                 "first_seen":         now_str,
@@ -569,6 +646,7 @@ def update_filtered_feed(
                 "destination_ports":  sorted(set(filter(None, [dest_port]))),
                 "protocols":          sorted(set(protocols)) if isinstance(protocols, list) else [],
                 "suricata_signatures": sorted(set(suricata_signatures)),
+                "seen_by":            [sensor_label] if sensor_label else [],
             }
         else:
             entry = metadata[ip]
@@ -588,6 +666,10 @@ def update_filtered_feed(
                 entry["suricata_signatures"] = sorted(set(
                     entry.get("suricata_signatures", []) + suricata_signatures
                 ))
+            if sensor_label:
+                existing = set(entry.get("seen_by", []))
+                existing.add(sensor_label)
+                entry["seen_by"] = sorted(existing)
 
     pruned = [
         ip for ip, meta in metadata.items()
@@ -600,6 +682,14 @@ def update_filtered_feed(
         print(f"  [filtered feed] Pruned {len(pruned)} IPs older than "
               f"{FEED_RETENTION_DAYS} days")
 
+    for ip, entry in metadata.items():
+        if ip_metadata and ip in ip_metadata:
+            ip_seen = ip_metadata[ip].get("seen_by", [])
+            existing = set(entry.get("seen_by", []))
+            merged = sorted(existing | set(ip_seen))
+            entry["seen_by"] = merged
+        entry["multi_sensor"] = len(entry.get("seen_by", [])) >= 2
+
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
 
     sorted_ips = sorted(metadata.keys())
@@ -611,9 +701,47 @@ def update_filtered_feed(
     return len(sorted_ips)
 
 
+def update_high_confidence_feed(
+    repo_root: Path,
+) -> int:
+    """
+    Generate the high-confidence feed from filtered_metadata.json.
+
+    Includes IPs that are either:
+      - corroborated by 2+ sensors (multi_sensor: true), OR
+      - classified as malicious
+
+    Returns the number of IPs in the high-confidence feed.
+    """
+    feeds_dir = repo_root / "feeds"
+    metadata_path = feeds_dir / "filtered_metadata.json"
+    feed_path     = feeds_dir / "threat_feed_high_confidence.txt"
+
+    if not metadata_path.exists():
+        feed_path.write_text("")
+        return 0
+
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except Exception:
+        metadata = {}
+
+    high_confidence = [
+        ip for ip, entry in metadata.items()
+        if isinstance(entry, dict)
+        and (entry.get("multi_sensor") or entry.get("classification") == "malicious")
+    ]
+
+    sorted_ips = sorted(high_confidence)
+    feed_path.write_text("\n".join(sorted_ips) + "\n" if sorted_ips else "")
+
+    print(f"  [high confidence] {len(sorted_ips)} IPs → {feed_path.name}")
+    return len(sorted_ips)
+
+
 def write_outputs(
     sessions: list,
-    sensor_id: str,
+    sensor_map: dict[str, str],
     workspace_id: str,
     window_start: datetime,
     window_end: datetime,
@@ -622,6 +750,7 @@ def write_outputs(
     error: str | None,
     feed_ip_count: int,
     filtered_ip_count: int = 0,
+    high_confidence_ip_count: int = 0,
     bootstrap: bool = False,
 ) -> None:
     """Write session data file (if sessions found) and run log (always)."""
@@ -633,30 +762,26 @@ def write_outputs(
     data_dir.mkdir(exist_ok=True)
     runs_dir.mkdir(exist_ok=True)
 
-    # Run log — always written
-    # Note: sensor_id and workspace_id are intentionally excluded — they are
-    # account identifiers that should not be committed to a public repository.
     run_log = {
-        "timestamp":         fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "time_window_start": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "time_window_end":   window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "sessions_found":    len(sessions),
-        "feed_ip_count":     feed_ip_count,
-        "filtered_ip_count": filtered_ip_count,
-        "duration_seconds":  round(duration, 2),
-        "error":             error,
+        "timestamp":                 fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "time_window_start":         window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "time_window_end":           window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sessions_found":            len(sessions),
+        "feed_ip_count":             feed_ip_count,
+        "filtered_ip_count":         filtered_ip_count,
+        "high_confidence_ip_count":  high_confidence_ip_count,
+        "sensor_count":              len(sensor_map),
+        "duration_seconds":          round(duration, 2),
+        "error":                     error,
     }
     run_log_path = runs_dir / f"{ts_str}_run_log.json"
     run_log_path.write_text(json.dumps(run_log, indent=2))
     print(f"[+] Run log written: {run_log_path.name}")
 
-    # Session data — only if we have sessions AND it's not a bootstrap
-    # Bootstrap collects 1M+ sessions — writing them as JSON would exceed
-    # GitHub's 100MB file size limit. Run log is sufficient for auditing.
     if sessions and not bootstrap:
         data_payload = {
             "fetch_timestamp":  fetch_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "sensor_id":        sensor_id,
+            "sensor_map":       sensor_map,
             "workspace_id":     workspace_id,
             "time_window_start": window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "time_window_end":  window_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -680,12 +805,11 @@ def is_first_run(repo_root: Path) -> bool:
 def main() -> None:
     api_key      = get_env("GREYNOISE_API_KEY")
     workspace_id = get_env("WORKSPACE_ID")
-    sensor_id    = get_env("SENSOR_ID")
+    sensor_map   = parse_sensor_ids()
 
     now       = datetime.now(timezone.utc)
     repo_root = Path(__file__).parent.parent
 
-    # Determine time window
     window_start_str = os.environ.get("TIME_WINDOW_START")
     window_end_str   = os.environ.get("TIME_WINDOW_END")
 
@@ -703,7 +827,7 @@ def main() -> None:
         window_start = now - timedelta(hours=6)
 
     print(f"[*] GreyNoise Swarm — sensor activity fetch")
-    print(f"    Sensor    : {sensor_id}")
+    print(f"    Sensors   : {len(sensor_map)} — {', '.join(f'{k[:8]}...→{v}' for k, v in sensor_map.items())}")
     print(f"    Workspace : {workspace_id}")
     print(f"    Window    : {window_start.strftime('%Y-%m-%dT%H:%M:%SZ')} → "
           f"{window_end.strftime('%Y-%m-%dT%H:%M:%SZ')}")
@@ -714,16 +838,18 @@ def main() -> None:
     sessions       = []
     feed_ip_count  = 0
     filtered_count = 0
+    hc_count       = 0
+    ip_meta: dict  = {}
 
     try:
-        # --- Full feed (v1 API) ---
         print(f"[*] Fetching all sessions (v1 API)...")
         sessions = fetch_sessions(api_key, workspace_id, window_start, window_end)
 
         print("[*] Updating full threat feed...")
-        feed_ip_count, _ = update_threat_feed(sessions, repo_root, now)
+        feed_ip_count, ip_meta = update_threat_feed(
+            sessions, repo_root, now, sensor_map=sensor_map,
+        )
 
-        # --- Filtered feed (v3 API) ---
         print("[*] Fetching malicious sessions (v3 API)...")
         filtered_sessions = fetch_filtered_sessions(
             api_key, window_start, window_end,
@@ -732,7 +858,11 @@ def main() -> None:
         print("[*] Updating filtered feed + metadata...")
         filtered_count = update_filtered_feed(
             filtered_sessions, repo_root, now,
+            sensor_map=sensor_map, ip_metadata=ip_meta,
         )
+
+        print("[*] Generating high-confidence feed...")
+        hc_count = update_high_confidence_feed(repo_root)
 
     except SystemExit:
         raise
@@ -744,15 +874,17 @@ def main() -> None:
 
     duration = time.monotonic() - t0
     write_outputs(
-        sessions, sensor_id, workspace_id,
+        sessions, sensor_map, workspace_id,
         window_start, window_end, now,
         duration, error, feed_ip_count,
         filtered_ip_count=filtered_count,
+        high_confidence_ip_count=hc_count,
         bootstrap=bootstrap,
     )
 
     print(f"[*] Done in {duration:.1f}s — {len(sessions)} sessions, "
-          f"{feed_ip_count} IPs in full feed, {filtered_count} in filtered feed.")
+          f"{feed_ip_count} IPs in full feed, {filtered_count} in filtered feed, "
+          f"{hc_count} in high-confidence feed.")
 
 
 if __name__ == "__main__":

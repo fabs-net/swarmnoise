@@ -62,6 +62,8 @@ def build_summary(
     by_org          = Counter()
     by_port         = Counter()
     by_classification = Counter()
+    by_sensor       = Counter()
+    multi_sensor_count = 0
     flags = {"is_vpn": 0, "is_tor": 0, "is_bot": 0}
 
     for ip, meta in filtered_metadata.items():
@@ -86,6 +88,12 @@ def build_summary(
         classification = meta.get("classification") or "unknown"
         by_classification[classification] += 1
 
+        if meta.get("multi_sensor"):
+            multi_sensor_count += 1
+
+        for sensor in (meta.get("seen_by") or []):
+            by_sensor[sensor] += 1
+
         for flag in ("is_vpn", "is_tor", "is_bot"):
             if meta.get(flag):
                 flags[flag] += 1
@@ -94,18 +102,20 @@ def build_summary(
         "month":        month_str,
         "generated_at": generated_at,
         "totals": {
-            "sessions":      total_sessions,
-            "full_feed_ips": len(ip_metadata),
-            "filtered_ips":  len(filtered_metadata),
-            "runs":          total_runs,
+            "sessions":           total_sessions,
+            "full_feed_ips":      len(ip_metadata),
+            "filtered_ips":       len(filtered_metadata),
+            "multi_sensor_ips":   multi_sensor_count,
+            "runs":               total_runs,
         },
-        "by_country":        dict(by_country.most_common()),
-        "by_tag":            dict(by_tag.most_common()),
-        "by_tag_category":   dict(by_tag_category.most_common()),
-        "by_org":            dict(by_org.most_common()),
+        "by_country":          dict(by_country.most_common()),
+        "by_tag":              dict(by_tag.most_common()),
+        "by_tag_category":     dict(by_tag_category.most_common()),
+        "by_org":              dict(by_org.most_common()),
         "by_destination_port": dict(by_port.most_common()),
-        "by_classification": dict(by_classification.most_common()),
-        "flags":             flags,
+        "by_classification":   dict(by_classification.most_common()),
+        "by_sensor":           dict(by_sensor.most_common()),
+        "flags":               flags,
     }
 
 
