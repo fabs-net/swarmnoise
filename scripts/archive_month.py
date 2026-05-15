@@ -19,10 +19,16 @@ No external dependencies beyond the standard library.
 """
 
 import json
+import os
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+
+_REPO_ROOT = Path(os.environ.get("ARCHIVE_REPO_ROOT", Path(__file__).parent.parent))
+FEEDS_DIR = _REPO_ROOT / "feeds"
+RUNS_DIR = _REPO_ROOT / "runs"
+ARCHIVE_DIR = _REPO_ROOT / "archive"
 
 
 def load_json(path: Path) -> dict | list:
@@ -134,12 +140,6 @@ def load_run_logs(runs_dir: Path) -> list:
 
 
 def main() -> None:
-    repo_root = Path(__file__).parent.parent
-
-    feeds_dir   = repo_root / "feeds"
-    runs_dir    = repo_root / "runs"
-    archive_dir = repo_root / "archive"
-
     # Determine the month being archived
     now       = datetime.now(timezone.utc)
     month_str = now.strftime("%Y-%m")
@@ -147,8 +147,8 @@ def main() -> None:
     print(f"[*] Archiving month: {month_str}")
 
     # --- Load source files ---
-    filtered_metadata_path = feeds_dir / "filtered_metadata.json"
-    ip_metadata_path       = feeds_dir / "ip_metadata.json"
+    filtered_metadata_path = FEEDS_DIR / "filtered_metadata.json"
+    ip_metadata_path       = FEEDS_DIR / "ip_metadata.json"
 
     if not filtered_metadata_path.exists():
         print("[error] feeds/filtered_metadata.json not found — nothing to archive.",
@@ -162,7 +162,7 @@ def main() -> None:
 
     filtered_metadata = load_json(filtered_metadata_path)
     ip_metadata       = load_json(ip_metadata_path)
-    run_logs          = load_run_logs(runs_dir)
+    run_logs          = load_run_logs(RUNS_DIR)
 
     print(f"  [+] Loaded {len(filtered_metadata)} filtered IPs, "
           f"{len(ip_metadata)} full feed IPs, "
@@ -179,7 +179,7 @@ def main() -> None:
           f"{month_runs} runs this month")
 
     # --- Write archive ---
-    out_dir = archive_dir / month_str
+    out_dir = ARCHIVE_DIR / month_str
     out_dir.mkdir(parents=True, exist_ok=True)
 
     (out_dir / "filtered_metadata.json").write_text(

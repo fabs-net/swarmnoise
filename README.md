@@ -27,7 +27,7 @@ Automated collector for [GreyNoise Project Swarm](https://www.greynoise.io/proje
 - Output: full feed + filtered feed + high-confidence feed + enriched metadata + run logs + monthly archive
 - Multi-sensor: map multiple sensors with human-readable labels; IPs corroborated by 2+ sensors flagged in metadata
 - Runtime: GitHub Actions only (no self-hosted infrastructure)
-- Update model: randomized 1 to 10 fetches/day via hourly scheduler checks
+- Update model: randomized 1 to 10 fetches/day via hourly scheduler checks (UTC)
 - Integration: direct HTTPS feed consumption by any firewall supporting external IP block lists
 - Access model: private fork with PAT-based HTTP Basic Auth on the firewall (recommended)
 

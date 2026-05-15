@@ -10,7 +10,12 @@ Subcommands:
   failure   — Record a fetch failure for retry at next tick.
 
 Environment variables:
-  TZ                 — Timezone for scheduling (default: UTC)
+  TZ                 — Timezone for scheduling (default: UTC). The provided
+                       workflow does not set TZ, so the scheduler runs in UTC.
+                       Power users may override this via a GitHub Actions
+                       variable (Settings → Variables → Actions) if a different
+                       day-boundary is required — but for most deployments UTC
+                       is correct and requires no configuration.
   GITHUB_EVENT_NAME  — Set by GitHub Actions (workflow_dispatch for manual runs)
   GITHUB_OUTPUT      — File path for writing step outputs
 """
